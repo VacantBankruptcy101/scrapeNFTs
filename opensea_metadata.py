@@ -8,6 +8,8 @@ Commands
   build     metadata.csv --images DIR       CSV + images -> one OpenSea JSON per image (+ manifest.csv)
   export    JSON_DIR -o metadata.csv        existing OpenSea JSON -> CSV (round-trip)
   validate  JSON_DIR                        check JSON files against OpenSea's metadata rules
+  match     TARGET_DIR SOURCE [--fix]       compare generated JSON with source (e.g. scraped OpenSea) metadata,
+                                            report every differing field/attribute, optionally replicate source
 
 CSV format (header row; column order is free)
   Reserved columns : token_id, filename, name, description, image, external_url,
@@ -461,6 +463,293 @@ def cmd_validate(a: argparse.Namespace) -> int:
     return 1 if bad else 0
 
 
+# --------------------------------------------------------------------------- match check
+CMP_FIELDS = ["name", "description", "external_url", "animation_url", "background_color", "youtube_url"]
+ATTR_KEYS = ("display_type", "trait_type", "value", "max_value")
+
+
+@dataclass
+class Item:
+    tid: Optional[int]
+    sha: Optional[str]
+    path: Path
+    meta: dict
+
+
+def canon(v: Any) -> str:
+    """Loose comparison form: 5 == 5.0 == "5", but "007" stays "007"."""
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return str(v).lower()
+    if isinstance(v, (int, float)):
+        return fmt_num(v)
+    s = str(v).strip()
+    if re.fullmatch(r"-?(0|[1-9]\d*)(\.\d+)?", s):
+        return fmt_num(to_number(s))
+    return s
+
+
+def canon_text(v: Any) -> str:
+    if v is None:
+        return ""
+    return "\n".join(l.rstrip() for l in str(v).replace("\r\n", "\n").strip().split("\n"))
+
+
+def ipfs_key(url: Any) -> str:
+    """Gateway-independent identity of an image URL (cid + path), else the URL itself."""
+    s = str(url or "").strip()
+    m = re.match(r"^(?:ipfs://(?:ipfs/)?|https?://[^/]+/ipfs/|/ipfs/)([^/?#]+)([^?#]*)", s)
+    if m:
+        return f"ipfs:{m.group(1)}{unquote(m.group(2))}"
+    m = re.match(r"^https?://([a-z0-9]+)\.ipfs\.[^/]+([^?#]*)", s)
+    if m:
+        return f"ipfs:{m.group(1)}{unquote(m.group(2))}"
+    return s
+
+
+def norm_source(meta: dict) -> dict[str, Any]:
+    """Reduce any real-world metadata variant to OpenSea-standard fields."""
+    def pick(*keys: str) -> Any:
+        return next((meta[k] for k in keys if meta.get(k) not in (None, "")), None)
+
+    out: dict[str, Any] = {
+        "name": pick("name", "title"),
+        "description": meta.get("description") or None,
+        "external_url": pick("external_url", "externalUrl", "external_link"),
+        "animation_url": pick("animation_url", "animationUrl", "animation"),
+        "youtube_url": meta.get("youtube_url") or None,
+    }
+    bg = meta.get("background_color")
+    out["background_color"] = normalize_color(str(bg)) if bg else None
+    img = pick("image", "image_url", "imageUrl", "image_uri", "imageURI", "image_data")
+    out["image"] = img if isinstance(img, str) else None
+    raw = pick("attributes", "traits", "properties") or []
+    attrs: list[dict[str, Any]] = []
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            attrs.append({"trait_type": k, "value": v.get("value") if isinstance(v, dict) else v})
+    elif isinstance(raw, list):
+        for a in raw:
+            attrs.append({k: a[k] for k in ATTR_KEYS if k in a} if isinstance(a, dict) else {"value": a})
+    out["attributes"] = [a for a in attrs if "value" in a]
+    return out
+
+
+def diff_attributes(src: list[dict], tgt: list[dict]) -> list[dict[str, Any]]:
+    from collections import defaultdict
+    issues: list[dict[str, Any]] = []
+    sg: dict[Any, list] = defaultdict(list)
+    tg: dict[Any, list] = defaultdict(list)
+    for a in src:
+        sg[a.get("trait_type")].append(a)
+    for a in tgt:
+        tg[a.get("trait_type")].append(a)
+    for tt in list(sg) + [k for k in tg if k not in sg]:
+        s, t = sg.get(tt, []), tg.get(tt, [])
+        for i in range(max(len(s), len(t))):
+            if i >= len(t):
+                issues.append({"kind": "missing", "trait": tt, "source": s[i], "target": None})
+            elif i >= len(s):
+                issues.append({"kind": "extra", "trait": tt, "source": None, "target": t[i]})
+            else:
+                ch = {}
+                for k in ("value", "display_type", "max_value"):
+                    sv, tv = s[i].get(k), t[i].get(k)
+                    same = canon_text(sv) == canon_text(tv) if k == "value" else canon(sv) == canon(tv)
+                    if not same:
+                        ch[k] = (tv, sv)  # (target, source)
+                if ch:
+                    issues.append({"kind": "changed", "trait": tt, "changes": ch,
+                                   "source": s[i], "target": t[i]})
+    if not issues and [a.get("trait_type") for a in src] != [a.get("trait_type") for a in tgt]:
+        issues.append({"kind": "order", "trait": None, "source": [a.get("trait_type") for a in src],
+                       "target": [a.get("trait_type") for a in tgt]})
+    return issues
+
+
+def diff_metadata(src_raw: dict, tgt: dict, ignore: set[str], check_image: bool) -> list[dict[str, Any]]:
+    src = norm_source(src_raw)
+    tn = norm_source(tgt)
+    issues: list[dict[str, Any]] = []
+    for f in CMP_FIELDS:
+        if f in ignore:
+            continue
+        cmp = canon_text if f == "description" else canon
+        if cmp(src[f]) != cmp(tn[f]):
+            issues.append({"scope": "field", "field": f, "source": src[f], "target": tn[f]})
+    if check_image and "image" not in ignore and ipfs_key(src["image"]) != ipfs_key(tn["image"]):
+        issues.append({"scope": "field", "field": "image", "source": src["image"], "target": tn["image"]})
+    if "attributes" not in ignore:
+        for i in diff_attributes(src["attributes"], tn["attributes"]):
+            issues.append({"scope": "attribute", **i})
+    return issues
+
+
+def apply_fix(src_raw: dict, tgt: dict, issues: list[dict[str, Any]], fix_image: bool) -> dict:
+    """Return a copy of target metadata with every mismatched field/attribute replicated from source."""
+    src = norm_source(src_raw)
+    fixed = dict(tgt)
+    for iss in issues:
+        if iss["scope"] == "field":
+            f = iss["field"]
+            if f == "image" and not fix_image:
+                continue
+            if src[f] in (None, ""):
+                fixed.pop(f, None)
+            else:
+                fixed[f] = src[f]
+    if any(i["scope"] == "attribute" for i in issues):
+        fixed["attributes"] = src["attributes"]  # replicate the source list, incl. order
+    return {k: fixed[k] for k in META_ORDER if k in fixed} | {k: v for k, v in fixed.items() if k not in META_ORDER}
+
+
+def describe(iss: dict[str, Any]) -> str:
+    short = lambda v: json.dumps(v, ensure_ascii=False)[:80]  # noqa: E731
+    if iss["scope"] == "field":
+        return f"~ {iss['field']}: {short(iss['target'])} -> {short(iss['source'])}"
+    k, t = iss["kind"], iss.get("trait")
+    if k == "missing":
+        return f"+ attribute {t!r}: missing, source has {short(iss['source'].get('value'))}"
+    if k == "extra":
+        return f"- attribute {t!r}: not in source (target has {short(iss['target'].get('value'))})"
+    if k == "changed":
+        return f"~ attribute {t!r}: " + ", ".join(f"{f} {short(a)} -> {short(b)}" for f, (a, b) in iss["changes"].items())
+    return "~ attribute order differs from source"
+
+
+def _tid_from_source_uri(src: str) -> Optional[int]:
+    rest = re.sub(r"^[a-z]+://", "", src)
+    parts = [p for p in rest.split("/") if p]
+    return token_id_from_stem(Path(parts[-1]).stem) if len(parts) > 1 else None
+
+
+def load_source(path: Path) -> list[Item]:
+    items: list[Item] = []
+    seen: set[Path] = set()
+    if path.is_file():
+        return [Item(token_id_from_stem(path.stem), None, path, json.loads(path.read_text("utf-8-sig")))]
+    for rec in sorted(path.rglob("record.json")):  # nft_scraper.py layout
+        mf = rec.parent / "metadata.json"
+        try:
+            r = json.loads(rec.read_text("utf-8"))
+            meta = json.loads(mf.read_text("utf-8-sig"))
+        except (OSError, ValueError):
+            continue
+        seen.add(mf)
+        tid = _tid_from_source_uri(r.get("source", ""))
+        tid = tid if tid is not None else token_id_from_stem(rec.parent.name) if rec.parent.name.isdigit() else None
+        sha = (r.get("assets", {}).get("image") or {}).get("sha256")
+        if isinstance(meta, dict):
+            items.append(Item(tid, sha, mf, meta))
+    for p in sorted(path.glob("*.json")) + sorted(q for q in path.iterdir() if q.is_file() and not q.suffix):
+        if p in seen or p.name in ("record.json", "match_report.json"):
+            continue
+        try:
+            meta = json.loads(p.read_text("utf-8-sig"))
+        except ValueError:
+            continue
+        if isinstance(meta, dict):
+            items.append(Item(token_id_from_stem(p.stem), None, p, meta))
+    return items
+
+
+def load_target(d: Path) -> list[Item]:
+    manifest: dict[str, dict] = {}
+    if (d / "manifest.csv").exists():
+        with open(d / "manifest.csv", newline="", encoding="utf-8-sig") as f:
+            manifest = {r["metadata_file"]: r for r in csv.DictReader(f)}
+    items: list[Item] = []
+    for p in sorted(d.iterdir()):
+        if not p.is_file() or p.suffix not in (".json", "") or p.name in ("manifest.csv", "match_report.json"):
+            continue
+        try:
+            meta = json.loads(p.read_text("utf-8-sig"))
+        except ValueError:
+            continue
+        if not isinstance(meta, dict):
+            continue
+        r = manifest.get(p.name)
+        tid = int(r["token_id"]) if r and str(r.get("token_id", "")).strip() else token_id_from_stem(p.stem)
+        items.append(Item(tid, (r or {}).get("image_sha256") or None, p, meta))
+    return items
+
+
+def cmd_match(a: argparse.Namespace) -> int:
+    tdir = Path(a.target)
+    srcs, tgts = load_source(Path(a.source)), load_target(tdir)
+    if not srcs or not tgts:
+        print(f"nothing to compare (source items: {len(srcs)}, target items: {len(tgts)})", file=sys.stderr)
+        return 2
+    by_sha: dict[str, list[Item]] = {}
+    by_tid: dict[int, list[Item]] = {}
+    for s in srcs:
+        if s.sha:
+            by_sha.setdefault(s.sha, []).append(s)
+        if s.tid is not None:
+            by_tid.setdefault(s.tid, []).append(s)
+    ignore = set(a.ignore or [])
+    report: list[dict[str, Any]] = []
+    used: set[int] = set()
+    unmatched_t: list[str] = []
+    n_match = n_diff = n_fixed = 0
+
+    for t in tgts:
+        s, how = None, ""
+        if t.sha and len(by_sha.get(t.sha, [])) == 1:
+            s, how = by_sha[t.sha][0], "image sha256"
+        elif t.tid is not None and len(by_tid.get(t.tid, [])) == 1:
+            s, how = by_tid[t.tid][0], "token_id"
+        if s is None:
+            unmatched_t.append(t.path.name)
+            continue
+        used.add(id(s))
+        issues = diff_metadata(s.meta, t.meta, ignore, a.check_image)
+        entry: dict[str, Any] = {"target": t.path.name, "source": str(s.path), "token_id": t.tid,
+                                 "matched_by": how, "ok": not issues, "issues": issues, "fixed": False}
+        if not issues:
+            n_match += 1
+        else:
+            n_diff += 1
+            print(f"#{t.tid} {t.path.name}  (matched by {how}, {len(issues)} mismatch{'es' if len(issues) != 1 else ''})")
+            for iss in issues:
+                print("   " + describe(iss))
+            if a.fix:
+                fixed = apply_fix(s.meta, t.meta, issues, a.fix_image)
+                left = diff_metadata(s.meta, fixed, ignore, a.check_image and a.fix_image)
+                if left:
+                    print(f"   !! could not fully replicate: {[describe(x) for x in left]}", file=sys.stderr)
+                else:
+                    if not a.no_backup:
+                        bak = t.path.parent / ".match_backup" / t.path.name
+                        if not bak.exists():
+                            bak.parent.mkdir(exist_ok=True)
+                            bak.write_bytes(t.path.read_bytes())
+                    atomic_write_text(t.path, json.dumps(fixed, indent=2, ensure_ascii=False) + "\n")
+                    entry["fixed"] = True
+                    n_fixed += 1
+                    print("   -> fixed (replicated from source)")
+        report.append(entry)
+
+    unmatched_s = [str(s.path) for s in srcs if id(s) not in used]
+    remaining = n_diff - n_fixed
+    rp = Path(a.report) if a.report else tdir / "match_report.json"
+    atomic_write_text(rp, json.dumps({
+        "summary": {"compared": len(report), "identical": n_match, "mismatched": n_diff, "fixed": n_fixed,
+                    "unmatched_target": unmatched_t, "unmatched_source_count": len(unmatched_s)},
+        "items": report}, indent=2, ensure_ascii=False, default=str) + "\n")
+    print(f"\ncompared {len(report)} | identical {n_match} | mismatched {n_diff} | fixed {n_fixed} | "
+          f"still mismatched {remaining}")
+    if unmatched_t:
+        print(f"{len(unmatched_t)} target files had no source counterpart (e.g. {unmatched_t[:3]})")
+    if unmatched_s:
+        print(f"{len(unmatched_s)} source items had no target file")
+    print(f"report: {rp}")
+    if remaining:
+        return 1
+    return 1 if a.require_all and (unmatched_t or unmatched_s) else 0
+
+
 # --------------------------------------------------------------------------- CLI
 def main() -> int:
     ap = argparse.ArgumentParser(description="OpenSea metadata builder (CSV <-> JSON, matched to images).")
@@ -495,6 +784,19 @@ def main() -> int:
     v = sub.add_parser("validate", help="validate OpenSea JSON files")
     v.add_argument("json_dir")
     v.set_defaults(fn=cmd_validate)
+
+    m = sub.add_parser("match", help="compare generated JSON against source metadata; --fix replicates source")
+    m.add_argument("target", help="dir of generated OpenSea JSON (with manifest.csv if available)")
+    m.add_argument("source", help="reference metadata: nft_scraper.py output dir, a dir of JSON, or one file")
+    m.add_argument("--fix", action="store_true", help="rewrite mismatched target files to replicate the source")
+    m.add_argument("--ignore", nargs="*", metavar="FIELD",
+                   help="fields to skip: name description external_url animation_url background_color youtube_url attributes")
+    m.add_argument("--check-image", action="store_true", help="also compare image URL (cid+path, gateway-independent)")
+    m.add_argument("--fix-image", action="store_true", help="with --fix, also copy the source image URL")
+    m.add_argument("--no-backup", action="store_true", help="don't save originals to .match_backup/")
+    m.add_argument("--report", help="report path (default: <target>/match_report.json)")
+    m.add_argument("--require-all", action="store_true", help="exit 1 if any file has no counterpart")
+    m.set_defaults(fn=cmd_match)
 
     args = ap.parse_args()
     return args.fn(args)
